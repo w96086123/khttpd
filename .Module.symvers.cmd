@@ -1,0 +1,1 @@
+savedcmd_/home/willy/linux2024/khttpd/Module.symvers :=  scripts/mod/modpost -m -a      -o /home/willy/linux2024/khttpd/Module.symvers -T /home/willy/linux2024/khttpd/modules.order -i Module.symvers -e 

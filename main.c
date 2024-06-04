@@ -10,6 +10,7 @@
 
 #define DEFAULT_PORT 8081
 #define DEFAULT_BACKLOG 100
+#define MODULE_NAME "khttpd"
 
 static ushort port = DEFAULT_PORT;
 module_param(port, ushort, S_IRUGO);
@@ -19,6 +20,9 @@ module_param(backlog, ushort, S_IRUGO);
 static struct socket *listen_socket;
 static struct http_server_param param;
 static struct task_struct *http_server;
+struct workqueue_struct *khttpd_wq;
+struct runtime_state states = {0};
+struct httpd_service daemon_list = {.is_stopped = false};
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 static int set_sock_opt(struct socket *sock,
@@ -154,13 +158,18 @@ static void close_listen_socket(struct socket *socket)
 
 static int __init khttpd_init(void)
 {
-    int err = open_listen_socket(port, backlog, &listen_socket);
+    int err = open_listen_socket(port, backlog, &listen_socket);  // 等待連線
     if (err < 0) {
         pr_err("can't open listen socket\n");
         return err;
     }
     param.listen_socket = listen_socket;
-    http_server = kthread_run(http_server_daemon, &param, KBUILD_MODNAME);
+
+    // create CMWQ
+    // khttpd_wq = alloc_workqueue(MODULE_NAME, 0, 0);
+
+    http_server = kthread_run(http_server_daemon, &param,
+                              KBUILD_MODNAME);  // 建立一個立刻執行的執行緒
     if (IS_ERR(http_server)) {
         pr_err("can't start http server daemon\n");
         close_listen_socket(listen_socket);
