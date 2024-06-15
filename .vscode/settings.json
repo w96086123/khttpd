@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "http_parser.h": "c"
+        "http_parser.h": "c",
+        "tcp.h": "c"
     }
 }

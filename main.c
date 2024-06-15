@@ -166,7 +166,7 @@ static int __init khttpd_init(void)
     param.listen_socket = listen_socket;
 
     // create CMWQ
-    // khttpd_wq = alloc_workqueue(MODULE_NAME, 0, 0);
+    khttpd_wq = alloc_workqueue(MODULE_NAME, 0, 0);
 
     http_server = kthread_run(http_server_daemon, &param,
                               KBUILD_MODNAME);  // 建立一個立刻執行的執行緒

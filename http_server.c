@@ -34,6 +34,8 @@
 
 extern struct workqueue_struct *khttpd_wq;
 
+
+
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
 {
     struct kvec iov = {.iov_base = (void *) buf, .iov_len = size};
@@ -222,7 +224,6 @@ int http_server_daemon(void *arg)
     struct work_struct *worker;
     struct http_server_param *param = (struct http_server_param *) arg;
 
-    khttpd_wq = alloc_workqueue("khttpd", WQ_UNBOUND, 0); /* workqueue.h API*/
     if (!khttpd_wq)
         return -ENOMEM;
     INIT_LIST_HEAD(&daemon_list.head);
