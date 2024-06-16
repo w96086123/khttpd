@@ -170,8 +170,6 @@ static int __init khttpd_init(void)
     }
     param.listen_socket = listen_socket;
 
-    if (!*WWWROOT)
-        WWWROOT[0] = '/';
     daemon_list.dir_path = WWWROOT;
 
     // create CMWQ
