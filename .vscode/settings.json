@@ -1,6 +1,8 @@
 {
     "files.associations": {
         "http_parser.h": "c",
-        "tcp.h": "c"
+        "tcp.h": "c",
+        "http_server.h": "c",
+        "version.h": "c"
     }
 }

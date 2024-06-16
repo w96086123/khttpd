@@ -13,16 +13,9 @@ struct httpd_service {
     char *dir_path;
     struct list_head head;
 };
+
 extern struct httpd_service daemon_list;
 
-struct http_request {
-    struct socket *socket;
-    enum http_method method;
-    char request_url[128];
-    int complete;
-    struct list_head node;
-    struct work_struct khttpd_work;
-};
 
 enum {
     TRACE_cthread_err = 1,  // number of create thread failed
@@ -38,7 +31,16 @@ struct runtime_state {
     atomic_t recvmsg, sendmsg;
     atomic_t send_err, recv_err;
 };
+
 extern struct runtime_state states;
+
+
+#define TRACE(ops)                      \
+    do {                                \
+        if (TRACE_##ops)                \
+            atomic_add(1, &states.ops); \
+    } while (0)
+
 
 extern int http_server_daemon(void *arg);
 

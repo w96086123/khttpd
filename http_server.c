@@ -30,10 +30,20 @@
     "Connection: KeepAlive" CRLF CRLF "501 Not Implemented" CRLF
 
 #define RECV_BUFFER_SIZE 4096
-
+#define SEND_BUFFER_SIZE 256
+#define BUFFER_SIZE 256
 
 extern struct workqueue_struct *khttpd_wq;
 
+struct http_request {
+    struct socket *socket;
+    enum http_method method;
+    char request_url[128];
+    int complete;
+    struct dir_context dir_context;
+    struct list_head node;
+    struct work_struct khttpd_work;
+};
 
 
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
@@ -70,17 +80,140 @@ static int http_server_send(struct socket *sock, const char *buf, size_t size)
     return done;
 }
 
+static void send_http_header(struct socket *socket,
+                             int status,
+                             const char *status_msg,
+                             char *type,
+                             int length,
+                             char *conn_msg)
+{
+    char buf[SEND_BUFFER_SIZE] = {0};
+    snprintf(buf, SEND_BUFFER_SIZE,
+             "HTTP/1.1 %d %s\r\n     \
+                Content-Type: %s\r\n    \
+                Content-Length: %d\r\n  \
+                Connection: %s\r\n\r\n",
+             status, status_msg, type, length, conn_msg);
+    http_server_send(socket, buf, strlen(buf));
+}
+
+static void send_http_content(struct socket *socket, char *content)
+{
+    char buf[SEND_BUFFER_SIZE] = {0};
+    snprintf(buf, SEND_BUFFER_SIZE, "%s\r\n", content);
+    http_server_send(socket, buf, strlen(buf));
+}
+
+static void catstr(char *res, char *first, char *second)
+{
+    int first_size = strlen(first);
+    int second_size = strlen(second);
+    memset(res, 0, BUFFER_SIZE);
+    memcpy(res, first, first_size);
+    memcpy(res + first_size, second, second_size);
+}
+
+static inline int read_file(struct file *fp, char *buf)
+{
+    return kernel_read(fp, buf, fp->f_inode->i_size, 0);
+}
+
+static bool tracedir(struct dir_context *dir_context,
+                     const char *name,
+                     int namelen,
+                     loff_t offset,
+                     u64 ino,
+                     unsigned int d_type)
+{
+    if (strcmp(name, ".")) {
+        struct http_request *request =
+            container_of(dir_context, struct http_request, dir_context);
+        char buf[SEND_BUFFER_SIZE] = {0};
+
+        snprintf(buf, SEND_BUFFER_SIZE,
+                 "<tr><td><a href=\"%s\">%s</a></td></tr>\r\n", name, name);
+        http_server_send(request->socket, buf, strlen(buf));
+    }
+    return true;
+}
+
+
+static bool handle_directory(struct http_request *request)
+{
+    struct file *fp;
+    char pwd[BUFFER_SIZE] = {0};
+
+
+    if (request->method != HTTP_GET) {
+        send_http_header(request->socket, HTTP_STATUS_NOT_IMPLEMENTED,
+                         http_status_str(HTTP_STATUS_NOT_IMPLEMENTED),
+                         "text/plain", 19, "close");
+        send_http_content(request->socket, "501 Not Implemented");
+        return false;
+    }
+
+    catstr(pwd, daemon_list.dir_path, request->request_url);
+    fp = filp_open(pwd, O_RDONLY, 0);
+
+
+    if (IS_ERR(fp)) {
+        send_http_header(request->socket, HTTP_STATUS_NOT_FOUND,
+                         http_status_str(HTTP_STATUS_NOT_FOUND), "text/plain",
+                         13, "Close");
+        send_http_content(request->socket, "404 Not Found");
+        return false;
+    }
+
+    if (S_ISDIR(fp->f_inode->i_mode)) {
+        char buf[SEND_BUFFER_SIZE] = {0};
+        request->dir_context.actor = tracedir;
+
+        snprintf(buf, SEND_BUFFER_SIZE, "HTTP/1.1 200 OK\r\n%s%s%s",
+                 "Connection: Keep-Alive\r\n", "Content-Type: text/html\r\n",
+                 "Keep-Alive: timeout=5, max=1000\r\n\r\n");
+        http_server_send(request->socket, buf, strlen(buf));
+
+        snprintf(buf, SEND_BUFFER_SIZE, "%s%s%s%s", "<html><head><style>\r\n",
+                 "body{font-family: monospace; font-size: 15px;}\r\n",
+                 "td {padding: 1.5px 6px;}\r\n",
+                 "</style></head><body><table>\r\n");
+        http_server_send(request->socket, buf, strlen(buf));
+
+        iterate_dir(fp, &request->dir_context);
+
+        snprintf(buf, SEND_BUFFER_SIZE, "</table></body></html>\r\n");
+        http_server_send(request->socket, buf, strlen(buf));
+        kernel_sock_shutdown(request->socket, SHUT_RDWR);
+
+    } else if (S_ISREG(fp->f_inode->i_mode)) {
+        char *read_data = kmalloc(fp->f_inode->i_size, GFP_KERNEL);
+        int ret = read_file(fp, read_data);
+
+        send_http_header(request->socket, HTTP_STATUS_OK,
+                         http_status_str(HTTP_STATUS_OK), "text/plain", ret,
+                         "Close");
+        http_server_send(request->socket, read_data, ret);
+        kfree(read_data);
+    }
+    filp_close(fp, NULL);
+    return true;
+}
+
 static int http_server_response(struct http_request *request, int keep_alive)
 {
-    char *response;
+    // char *response;
 
-    pr_info("requested_url = %s\n", request->request_url);
-    if (request->method != HTTP_GET)
-        response = keep_alive ? HTTP_RESPONSE_501_KEEPALIVE : HTTP_RESPONSE_501;
-    else
-        response = keep_alive ? HTTP_RESPONSE_200_KEEPALIVE_DUMMY
-                              : HTTP_RESPONSE_200_DUMMY;
-    http_server_send(request->socket, response, strlen(response));
+    // pr_info("requested_url = %s\n", request->request_url);
+    // if (request->method != HTTP_GET)
+    //     response = keep_alive ? HTTP_RESPONSE_501_KEEPALIVE :
+    //     HTTP_RESPONSE_501;
+    // else
+    //     response = keep_alive ? HTTP_RESPONSE_200_KEEPALIVE_DUMMY
+    //                           : HTTP_RESPONSE_200_DUMMY;
+    // http_server_send(request->socket, response, strlen(response));
+    // return 0;
+    if (!handle_directory(request))
+        pr_info("Something went wrong\n");
     return 0;
 }
 
@@ -98,6 +231,9 @@ static int http_parser_callback_request_url(http_parser *parser,
                                             size_t len)
 {
     struct http_request *request = parser->data;
+    // if requst is "..", remove last character
+    if (p[len - 1] == '/')
+        len--;
     strncat(request->request_url, p, len);
     return 0;
 }
@@ -157,32 +293,33 @@ static void http_server_worker(struct work_struct *work)
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
 
-    buf = kzalloc(RECV_BUFFER_SIZE, GFP_KERNEL);
+rekmalloc:
+    buf = kmalloc(RECV_BUFFER_SIZE, GFP_KERNEL);
     if (!buf) {
-        pr_err("can't allocate memory!\n");
-        return;
+        // TRACE(kmalloc_err);
+        goto rekmalloc;
     }
-
+    // set the initial parameter of parser
     http_parser_init(&parser, HTTP_REQUEST);
     parser.data = &worker->socket;
-
     // check the thread should be stop or not
-    while (!kthread_should_stop()) {
+    while (!daemon_list.is_stopped) {
+        // receive data
         int ret = http_server_recv(worker->socket, buf, RECV_BUFFER_SIZE - 1);
         if (ret <= 0) {
             if (ret)
-                pr_err("recv error: %d\n", ret);
-            break;
-        }
-        http_parser_execute(&parser, &setting, buf, ret);
+                // TRACE(recv_err);
+                break;
+        } else
+            // TRACE(recvmsg);
+            // parse the data received
+            http_parser_execute(&parser, &setting, buf, ret);
         if (worker->complete && !http_should_keep_alive(&parser))
             break;
-        memset(buf, 0, RECV_BUFFER_SIZE);
+        memset(buf, 0, ret);
     }
     kernel_sock_shutdown(worker->socket, SHUT_RDWR);
-    sock_release(worker->socket);
     kfree(buf);
-    return;
 }
 
 
@@ -224,33 +361,36 @@ int http_server_daemon(void *arg)
     struct work_struct *worker;
     struct http_server_param *param = (struct http_server_param *) arg;
 
-    if (!khttpd_wq)
-        return -ENOMEM;
-    INIT_LIST_HEAD(&daemon_list.head);
+
 
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
+
+    INIT_LIST_HEAD(&daemon_list.head);
 
 
     while (!kthread_should_stop()) {
         int err = kernel_accept(param->listen_socket, &socket, 0);
         if (err < 0) {
+            // check there is any signal occurred or not
             if (signal_pending(current))
                 break;
-            pr_err("kernel_accept() error: %d\n", err);
+            // TRACE(accept_err);
             continue;
         }
         // 利用 CMWQ 的方式建立 worker
         worker = create_work(socket);
         if (IS_ERR(worker)) {
-            pr_err("can't create more worker process\n");
+            // TRACE(cthread_err);
+            kernel_sock_shutdown(socket, SHUT_RDWR);
+            sock_release(socket);
             continue;
         }
-        // start server workqueue
+
+        /* start server worker */
         queue_work(khttpd_wq, worker);
     }
     daemon_list.is_stopped = true;
     free_work();
-    destroy_workqueue(khttpd_wq);
     return 0;
 }
