@@ -6,27 +6,8 @@
 
 #include "http_server.h"
 #include "mime_type.h"
+#include "timer.h"
 
-#define HTTP_RESPONSE_200_DUMMY                               \
-    ""                                                        \
-    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
-    "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
-    "Connection: Close" CRLF CRLF "Hello World!" CRLF
-#define HTTP_RESPONSE_200_KEEPALIVE_DUMMY                     \
-    ""                                                        \
-    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
-    "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
-    "Connection: Keep-Alive" CRLF CRLF "Hello World!" CRLF
-#define HTTP_RESPONSE_501                                              \
-    ""                                                                 \
-    "HTTP/1.1 501 Not Implemented" CRLF "Server: " KBUILD_MODNAME CRLF \
-    "Content-Type: text/plain" CRLF "Content-Length: 21" CRLF          \
-    "Connection: Close" CRLF CRLF "501 Not Implemented" CRLF
-#define HTTP_RESPONSE_501_KEEPALIVE                                    \
-    ""                                                                 \
-    "HTTP/1.1 501 Not Implemented" CRLF "Server: " KBUILD_MODNAME CRLF \
-    "Content-Type: text/plain" CRLF "Content-Length: 21" CRLF          \
-    "Connection: KeepAlive" CRLF CRLF "501 Not Implemented" CRLF
 #define SEND_HTTP_MSG(socket, buf, format, ...)           \
     snprintf(buf, SEND_BUFFER_SIZE, format, __VA_ARGS__); \
     http_server_send(socket, buf, strlen(buf))
@@ -37,15 +18,6 @@
 
 extern struct workqueue_struct *khttpd_wq;
 
-struct http_request {
-    struct socket *socket;
-    enum http_method method;
-    char request_url[128];
-    int complete;
-    struct dir_context dir_context;
-    struct list_head node;
-    struct work_struct khttpd_work;
-};
 
 
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
@@ -120,17 +92,18 @@ static bool tracedir(struct dir_context *dir_context,
 }
 
 
-static bool handle_directory(struct http_request *request)
+static bool handle_directory(struct http_request *request, int keep_alive)
 {
     struct file *fp;
     char buf[SEND_BUFFER_SIZE] = {0}, pwd[BUFFER_SIZE] = {0};
-    request->dir_context.actor = tracedir;
+    char *conn = keep_alive ? "Keep-Alive" : "Close";
+
 
     if (request->method != HTTP_GET) {
-        SEND_HTTP_MSG(request->socket, buf, "%s%s%s%s%s",
+        SEND_HTTP_MSG(request->socket, buf, "%s%s%s%s%s%s",
                       "HTTP/1.1 501 Not Implemented\r\n",
                       "Content-Type: text/plain\r\n", "Content-Length: 19\r\n",
-                      "Connection: Close\r\n\r\n", "501 Not Implemented");
+                      "Connection: ", conn, "\r\n\r\n501 Not Implemented");
         return false;
     }
 
@@ -139,22 +112,24 @@ static bool handle_directory(struct http_request *request)
 
 
     if (IS_ERR(fp)) {
-        SEND_HTTP_MSG(request->socket, buf, "%s%s%s%s%s",
+        SEND_HTTP_MSG(request->socket, buf, "%s%s%s%s%s%s",
                       "HTTP/1.1 404 Not Found\r\n",
                       "Content-Type: text/plain\r\n", "Content-Length: 13\r\n",
-                      "Connection: Close\r\n\r\n", "404 Not Found");
+                      "Connection: ", conn, "\r\n\r\n404 Not Found");
         return false;
     }
 
     if (S_ISDIR(fp->f_inode->i_mode)) {
-        SEND_HTTP_MSG(request->socket, buf, "%s%s%s", "HTTP/1.1 200 OK\r\n",
-                      "Content-Type: text/html\r\n",
-                      "Transfer-Encoding: chunked\r\n\r\n");
+        SEND_HTTP_MSG(request->socket, buf, "%s%s%s%s%s%s",
+                      "HTTP/1.1 200 OK\r\n", "Content-Type: text/html\r\n",
+                      "Transfer-Encoding: chunked\r\n", "Connection: ", conn,
+                      "\r\n\r\n");
         SEND_HTTP_MSG(
             request->socket, buf, "7B\r\n%s%s%s%s", "<html><head><style>\r\n",
             "body{font-family: monospace; font-size: 15px;}\r\n",
             "td {padding: 1.5px 6px;}\r\n", "</style></head><body><table>\r\n");
 
+        request->dir_context.actor = tracedir;
         iterate_dir(fp, &request->dir_context);
 
         SEND_HTTP_MSG(request->socket, buf, "%s",
@@ -165,9 +140,9 @@ static bool handle_directory(struct http_request *request)
         int ret = read_file(fp, read_data);
 
         SEND_HTTP_MSG(
-            request->socket, buf, "%s%s%s%s%d%s", "HTTP/1.1 200 OK\r\n",
+            request->socket, buf, "%s%s%s%s%d%s%s%s", "HTTP/1.1 200 OK\r\n",
             "Content-Type: ", get_mime_str(request->request_url),
-            "\r\nContent-Length: ", ret, "\r\nConnection: Close\r\n\r\n");
+            "\r\nContent-Length: ", ret, "\r\nConnection: ", conn, "\r\n\r\n");
         http_server_send(request->socket, read_data, ret);
         kfree(read_data);
     }
@@ -177,18 +152,7 @@ static bool handle_directory(struct http_request *request)
 
 static int http_server_response(struct http_request *request, int keep_alive)
 {
-    // char *response;
-
-    // pr_info("requested_url = %s\n", request->request_url);
-    // if (request->method != HTTP_GET)
-    //     response = keep_alive ? HTTP_RESPONSE_501_KEEPALIVE :
-    //     HTTP_RESPONSE_501;
-    // else
-    //     response = keep_alive ? HTTP_RESPONSE_200_KEEPALIVE_DUMMY
-    //                           : HTTP_RESPONSE_200_DUMMY;
-    // http_server_send(request->socket, response, strlen(response));
-    // return 0;
-    if (handle_directory(request) > 0)
+    if (handle_directory(request, keep_alive) > 0)
         pr_info("Something went wrong\n");
     return 0;
 }
@@ -197,7 +161,7 @@ static int http_parser_callback_message_begin(http_parser *parser)
 {
     struct http_request *request = parser->data;
     struct socket *socket = request->socket;
-    memset(request, 0x00, sizeof(struct http_request));
+    memset(request->request_url, 0, 128);
     request->socket = socket;
     return 0;
 }
@@ -279,6 +243,10 @@ rekmalloc:
     http_parser_init(&parser, HTTP_REQUEST);
     parser.data = &worker->socket;
     // check the thread should be stop or not
+
+    // add timer to manage connection
+    http_add_timer(worker, TIMEOUT_DEFAULT, kernel_sock_shutdown);
+
     while (!daemon_list.is_stopped) {
         // receive data
         int ret = http_server_recv(worker->socket, buf, RECV_BUFFER_SIZE - 1);
@@ -289,10 +257,14 @@ rekmalloc:
         } else
             // TRACE(recvmsg);
             // parse the data received
-            http_parser_execute(&parser, &setting, buf, ret);
+            if (!http_parser_execute(&parser, &setting, buf, ret))
+                continue;
+
         if (worker->complete && !http_should_keep_alive(&parser))
             break;
-        memset(buf, 0, ret);
+
+        http_timer_update(worker->timer_item, TIMEOUT_DEFAULT);
+        memset(buf, 0, RECV_BUFFER_SIZE);
     }
     kernel_sock_shutdown(worker->socket, SHUT_RDWR);
     kfree(buf);
@@ -344,9 +316,14 @@ int http_server_daemon(void *arg)
 
     INIT_LIST_HEAD(&daemon_list.head);
 
+    // initial timer to manage.connect
+    http_timer_init();
+
 
     while (!kthread_should_stop()) {
-        int err = kernel_accept(param->listen_socket, &socket, 0);
+        int err = kernel_accept(param->listen_socket, &socket, SOCK_NONBLOCK);
+        handle_expired_timers();
+
         if (err < 0) {
             // check there is any signal occurred or not
             if (signal_pending(current))
@@ -357,7 +334,6 @@ int http_server_daemon(void *arg)
         // 利用 CMWQ 的方式建立 worker
         worker = create_work(socket);
         if (IS_ERR(worker)) {
-            // TRACE(cthread_err);
             kernel_sock_shutdown(socket, SHUT_RDWR);
             sock_release(socket);
             continue;

@@ -16,6 +16,16 @@ struct httpd_service {
 
 extern struct httpd_service daemon_list;
 
+struct http_request {
+    struct socket *socket;
+    enum http_method method;
+    char request_url[128];
+    int complete;
+    struct dir_context dir_context;
+    struct list_head node;
+    struct work_struct khttpd_work;
+    void *timer_item;
+};
 
 enum {
     TRACE_cthread_err = 1,  // number of create thread failed
@@ -42,6 +52,6 @@ extern struct runtime_state states;
     } while (0)
 
 
-extern int http_server_daemon(void *arg);
+int http_server_daemon(void *arg);
 
 #endif
