@@ -28,6 +28,14 @@ clean:
 	make -C $(KDIR) M=$(PWD) clean
 	$(RM) htstress
 
+trace: all
+	sudo rmmod khttpd.ko
+	sudo insmod khttpd.ko
+	sh trace.sh
+
+distrace:
+	echo nop > /sys/kernel/debug/tracing/current_tracer
+
 # Download http_parser.[ch] from nodejs/http-parser repository
 # the inclusion of standard header files such as <string.h> will be replaced
 # with "compat/string.h", which is just a wrapper to Linux kernel headers.
