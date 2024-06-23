@@ -6,19 +6,25 @@
 
 typedef int (*prio_queue_comparator)(void *pi, void *pj);
 typedef struct {
-    void **priv;
+    rcu_timer_node_t **priv;
     atomic_t nalloc;  // number of items in queue
     atomic_t size;
     prio_queue_comparator comp;
-} prio_queue_t;
+} rcu_prio_queue_t;
 
-static bool prio_queue_init(prio_queue_t *ptr,
+static bool prio_queue_init(rcu_prio_queue_t *ptr,
                             prio_queue_comparator comp,
                             int size)
 {
-    ptr->priv = kmalloc(sizeof(void *) * (size + 1), GFP_KERNEL);
+    if (size <= 0 || !comp) {
+        pr_err("init: invalid size or comparator");
+        return false;
+    }
+
+    // 使用 kzalloc 确保内存零初始化
+    ptr->priv = kzalloc(sizeof(rcu_timer_node_t *) * (size + 1), GFP_KERNEL);
     if (!ptr->priv) {
-        pr_err("init: kmalloc failed");
+        pr_err("init: kzalloc failed");
         return false;
     }
 
@@ -28,79 +34,107 @@ static bool prio_queue_init(prio_queue_t *ptr,
     return true;
 }
 
-static void prio_queue_free(prio_queue_t *ptr)
+static void prio_queue_free(rcu_prio_queue_t *ptr)
 {
     kfree(ptr->priv);
 }
 
-static inline bool prio_queue_is_empty(prio_queue_t *ptr)
+static inline bool prio_queue_is_empty(rcu_prio_queue_t *ptr)
 {
     return !atomic_read(&ptr->nalloc);
 }
 
 // return minimun member in queue
-static inline void *prio_queue_min(prio_queue_t *ptr)
+static inline void *prio_queue_min(rcu_prio_queue_t *ptr)
 {
-    return prio_queue_is_empty(ptr) ? NULL : ptr->priv[1];
+    return prio_queue_is_empty(ptr) ? NULL : rcu_dereference(ptr->priv[1]);
 }
 
 
 
-static inline void prio_queue_swap(prio_queue_t *ptr, size_t i, size_t j)
+static inline void prio_queue_swap(rcu_prio_queue_t *ptr, size_t i, size_t j)
 {
-    void *tmp = ptr->priv[i];
-    ptr->priv[i] = ptr->priv[j];
-    ptr->priv[j] = tmp;
+    // 保护指针的读取
+    void *tmp = rcu_dereference(ptr->priv[i]);
+    // 更新指针，确保写入操作的安全性
+    rcu_assign_pointer(ptr->priv[i], rcu_dereference(ptr->priv[j]));
+    rcu_assign_pointer(ptr->priv[j], tmp);
 }
 
 
-static size_t prio_queue_sink(prio_queue_t *ptr, size_t k)
+static size_t prio_queue_sink(rcu_prio_queue_t *ptr, size_t k)
 {
     size_t nalloc = atomic_read(&ptr->nalloc);
 
     while ((k << 1) <= nalloc) {
         size_t j = k << 1;
-        if (j < nalloc && ptr->comp(ptr->priv[j + 1], ptr->priv[j]))
+
+        // 使用 RCU 保护指针访问
+        rcu_read_lock();
+        if (j + 1 <= nalloc && ptr->comp(rcu_dereference(ptr->priv[j + 1]), rcu_dereference(ptr->priv[j]))) {
             j++;
-        if (!ptr->comp(ptr->priv[j], ptr->priv[k]))
+        }
+
+        if (!ptr->comp(rcu_dereference(ptr->priv[j]), rcu_dereference(ptr->priv[k]))) {
+            rcu_read_unlock();
             break;
+        }
+
         prio_queue_swap(ptr, j, k);
+        rcu_read_unlock();
         k = j;
     }
     return k;
 }
 
+void rcu_free_callback(struct rcu_head *head)
+{
+    // 使用 container_of 宏获取包含 rcu 成员的结构体指针，然后调用 kfree
+    kfree(container_of(head, rcu_timer_node_t, rcu));
+}
+
 /* remove the item with minimum key value from the heap */
-static bool prio_queue_delmin(prio_queue_t *ptr)
+static bool prio_queue_delmin(rcu_prio_queue_t *ptr)
 {
     size_t nalloc;
-    timer_node_t *node;
+    rcu_timer_node_t *node;
+
+    int retry_count = 0;
+    const int max_retries = 10;
 
     do {
         if (prio_queue_is_empty(ptr))
             return true;
 
         nalloc = atomic_read(&ptr->nalloc);
+        rcu_read_lock();
         prio_queue_swap(ptr, 1, nalloc);
 
         if (nalloc == atomic_read(&ptr->nalloc)) {
-            node = ptr->priv[nalloc--];
+            node = rcu_dereference(ptr->priv[nalloc]);
+            if (node) {
+                atomic_set(&ptr->nalloc, nalloc - 1);
+            }
+            rcu_read_unlock();
             break;
         }
+        rcu_read_unlock();
         // change again
-        prio_queue_swap(ptr, 1, nalloc);
+        if (++retry_count > max_retries) {
+            pr_err("Failed to delete min item after %d retries\n", retry_count);
+            return false;
+        }
     } while (1);
 
-    atomic_set(&ptr->nalloc, nalloc);
     prio_queue_sink(ptr, 1);
     if (node->callback)
         node->callback(node->socket, SHUT_RDWR);
 
-    kfree(node);
+    call_rcu(&node->rcu, rcu_free_callback);
     return true;
 }
 
-static inline bool prio_queue_cmpxchg(timer_node_t **var,
+static inline bool prio_queue_cmpxchg(rcu_timer_node_t **var,
                                       long long *old,
                                       long long neu)
 {
@@ -128,23 +162,34 @@ static inline bool prio_queue_cmpxchg(timer_node_t **var,
 }
 
 /* add a new item to the heap */
-static bool prio_queue_insert(prio_queue_t *ptr, void *item)
+static bool prio_queue_insert(rcu_prio_queue_t *ptr, void *item)
 {
-    timer_node_t **slot;  // get the address we want to store item
-    size_t old_nalloc, old_size;
+    rcu_timer_node_t **slot;  // get the address we want to store item
+    size_t old_nalloc;
     long long old;
+    int retry_count = 0;
+    const int max_retries = 10;
 
 restart:
     old_nalloc = atomic_read(&ptr->nalloc);
-    old_size = atomic_read(&ptr->nalloc);
+
+    if (old_nalloc >= atomic_read(&ptr->size)) {
+        pr_err("Priority queue is full\n");
+        return false;
+    }
 
     // get the address want to store
-    slot = (timer_node_t **) &ptr->priv[old_nalloc + 1];
+    slot = (rcu_timer_node_t **) &ptr->priv[old_nalloc + 1];
     old = (long long) *slot;
 
     do {
         if (old_nalloc != atomic_read(&ptr->nalloc))
-            goto restart;
+            if (++retry_count > max_retries) {
+                pr_err("Failed to insert item after %d retries\n", retry_count);
+                return false;
+            } else {
+                goto restart;
+            }
     } while (!prio_queue_cmpxchg(slot, &old, (long long) item));
 
     atomic_inc(&ptr->nalloc);
@@ -154,10 +199,10 @@ restart:
 
 static int timer_comp(void *ti, void *tj)
 {
-    return ((timer_node_t *) ti)->key < ((timer_node_t *) tj)->key ? 1 : 0;
+    return ((rcu_timer_node_t *) ti)->key < ((rcu_timer_node_t *) tj)->key ? 1 : 0;
 }
 
-static prio_queue_t timer;
+static rcu_prio_queue_t timer;
 static atomic_t current_msec;
 
 static void current_time_update(void)
@@ -177,7 +222,7 @@ void http_timer_init(void)
 void handle_expired_timers(void)
 {
     while (!prio_queue_is_empty(&timer)) {
-        timer_node_t *node;
+        rcu_timer_node_t *node;
 
         current_time_update();
         node = prio_queue_min(&timer);
@@ -191,7 +236,7 @@ void handle_expired_timers(void)
 
 bool http_add_timer(struct http_request *req, size_t timeout, timer_callback cb)
 {
-    timer_node_t *node = kmalloc(sizeof(timer_node_t), GFP_KERNEL);
+    rcu_timer_node_t *node = kmalloc(sizeof(rcu_timer_node_t), GFP_KERNEL);
 
     if (!node)
         return false;
@@ -207,7 +252,7 @@ bool http_add_timer(struct http_request *req, size_t timeout, timer_callback cb)
     return true;
 }
 
-void http_timer_update(timer_node_t *node, size_t timeout)
+void http_timer_update(rcu_timer_node_t *node, size_t timeout)
 {
     current_time_update();
     node->key = atomic_read(&current_msec) + timeout;
@@ -220,7 +265,11 @@ void http_free_timer(void)
 {
     int i;
     size_t nalloc = atomic_read(&timer.nalloc);
-    for (i = 1; i < nalloc + 1; i++)
-        kfree(timer.priv[i]);
+    for (i = 1; i <= nalloc; i++) {
+            rcu_timer_node_t *node = rcu_dereference(timer.priv[i]);
+            if (node) {
+                call_rcu(&node->rcu, rcu_free_callback);
+            }
+        }
     prio_queue_free(&timer);
 }
