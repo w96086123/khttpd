@@ -3,6 +3,9 @@
         "http_parser.h": "c",
         "tcp.h": "c",
         "http_server.h": "c",
-        "version.h": "c"
+        "version.h": "c",
+        "memcache.h": "c",
+        "stdlib.h": "c",
+        "mime_type.h": "c"
     }
 }

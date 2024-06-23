@@ -5,9 +5,11 @@
 #include <linux/tcp.h>
 #include <linux/version.h>
 #include <net/sock.h>
+#include <linux/hashtable.h>
 
 #include "http_server.h"
 #include "timer.h"
+#include "cache.h"
 
 #define DEFAULT_PORT 8081
 #define DEFAULT_BACKLOG 100
@@ -175,7 +177,7 @@ static int __init khttpd_init(void)
 
     // create CMWQ
     khttpd_wq = alloc_workqueue(MODULE_NAME, 0, 0);
-
+    cache_init();
     http_server = kthread_run(http_server_daemon, &param,
                               KBUILD_MODNAME);  // 建立一個立刻執行的執行緒
     if (IS_ERR(http_server)) {
@@ -192,6 +194,7 @@ static void __exit khttpd_exit(void)
     close_listen_socket(listen_socket);
     http_free_timer();
     destroy_workqueue(khttpd_wq);
+    cache_clear();
     pr_info("module unloaded\n");
 }
 
