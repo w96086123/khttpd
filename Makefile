@@ -9,6 +9,7 @@ khttpd-objs := \
 	http_server.o \
 	timer.o \
 	cache.o \
+	memcache.o \
 	main.o
 
 GIT_HOOKS := .git/hooks/applied
