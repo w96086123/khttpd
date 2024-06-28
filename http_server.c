@@ -8,6 +8,7 @@
 #include "mime_type.h"
 #include "timer.h"
 #include "cache.h"
+
 #define SEND_HTTP_MSG(socket, buf, format, ...)           \
     snprintf(buf, SEND_BUFFER_SIZE, format, __VA_ARGS__); \
     http_server_send(socket, buf, strlen(buf))
@@ -18,7 +19,9 @@
 
 extern struct workqueue_struct *khttpd_wq;
 
-
+struct tempResponse {
+    char response[4096];
+} tempResponse;
 
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
 {
@@ -77,38 +80,20 @@ static bool tracedir(struct dir_context *dir_context,
                      u64 ino,
                      unsigned int d_type)
 {
-if (strcmp(name, ".")) {
+    if (strcmp(name, ".")) {
         struct http_request *request = container_of(dir_context, struct http_request, dir_context);
         char buf[SEND_BUFFER_SIZE] = {0};
+        char temp[SEND_BUFFER_SIZE] = {0};
         char *url = !strcmp(request->request_url, "/") ? "" : request->request_url;
-        int item_length = snprintf(buf, SEND_BUFFER_SIZE,
-                                   "<tr><td><a href=\"%s/%s\">%s</a></td></tr>\r\n",
-                                   url, name, name);
+        snprintf(temp, SEND_BUFFER_SIZE, 
+                    "<tr><td><a href=\"%s/%s\">%s</a></td></tr>",
+                    url, name, name);
 
-        // 查找或创建缓存条目
-        struct cache_item *cache_entry = cache_lookup(request->request_url);
-        if (!cache_entry) {
-            cache_entry = cache_create_item(request->request_url);
-            if (!cache_entry) {
-                pr_err("Failed to create cache item for URL: %s\n", request->request_url);
-                return false;
-            }
-        }
+        strncat(tempResponse.response, temp, sizeof(tempResponse.response) - strlen(tempResponse.response) - 1);
+        SEND_HTTP_MSG(request->socket, buf, 
+                    "%lx\r\n<tr><td><a href=\"%s/%s\">%s</a></td></tr>\r\n",
+                    34 + strlen(url) + (namelen << 1), url, name, name);
 
-        // 更新缓存中的响应数据
-        if (cache_entry->response_size + item_length < cache_entry->max_size) {
-            strncat(cache_entry->response_data, buf, cache_entry->max_size - cache_entry->response_size - 1);
-            cache_entry->response_size += item_length;
-
-            // 插入或更新缓存条目
-            cache_insert(request->request_url, cache_entry->response_data);
-
-            // 发送更新的数据
-            SEND_HTTP_MSG(request->socket, buf, "%s", buf);
-        } else {
-            pr_err("Cache data buffer overflow for URL: %s\n", request->request_url);
-            return false;
-        }
     }
     return true;
 }
@@ -119,115 +104,98 @@ static bool handle_directory(struct http_request *request, int keep_alive)
     struct file *fp;
     char buf[SEND_BUFFER_SIZE] = {0}, pwd[BUFFER_SIZE] = {0};
     char *conn = keep_alive ? "Keep-Alive" : "Close";
-    char *response_data;
 
     if (request->method != HTTP_GET) {
-        response_data = kmalloc(SEND_BUFFER_SIZE, GFP_KERNEL);
-        if (!response_data) {
-            pr_err("Failed to allocate memory for response_data\n");
-            return false;
-        }
-
-        snprintf(response_data, SEND_BUFFER_SIZE, 
-                 "HTTP/1.1 501 Not Implemented\r\n"
-                 "Content-Type: text/plain\r\n"
-                 "Content-Length: 19\r\n"
-                 "Connection: %s\r\n\r\n501 Not Implemented", conn);
-
-        cache_insert(request->request_url, response_data); // 插入缓存
-        SEND_HTTP_MSG(request->socket, buf, "%s", response_data); // 发送响应
-        kfree(response_data);
+        SEND_HTTP_MSG(request->socket, buf, "%s%s%s%s%s%s",
+                "HTTP/1.1 501 Not Implemented\r\n",
+                "Content-Type: text/plain\r\n", "Content-Length: 19\r\n",
+                "Connection: ", conn, "\r\n\r\n501 Not Implemented");
         return false;
     }
 
     catstr(pwd, daemon_list.dir_path, request->request_url);
     fp = filp_open(pwd, O_RDONLY, 0);
     if (IS_ERR(fp)) {
-        response_data = kmalloc(SEND_BUFFER_SIZE, GFP_KERNEL);
-        if (!response_data) {
-            pr_err("Failed to allocate memory for response_data\n");
-            return false;
-        }
-
-        snprintf(response_data, SEND_BUFFER_SIZE, 
-                 "HTTP/1.1 404 Not Found\r\n"
-                 "Content-Type: text/plain\r\n"
-                 "Content-Length: 13\r\n"
-                 "Connection: %s\r\n\r\n404 Not Found", conn);
-
-        cache_insert(request->request_url, response_data); // 插入缓存
-        SEND_HTTP_MSG(request->socket, buf, "%s", response_data); // 发送响应
-        kfree(response_data);
+        SEND_HTTP_MSG(request->socket, buf, "%s%s%s%s%s%s",
+                      "HTTP/1.1 404 Not Found\r\n",
+                      "Content-Type: text/plain\r\n", "Content-Length: 13\r\n",
+                      "Connection: ", conn, "\r\n\r\n404 Not Found");
         return false;
     }
-
+    struct cache_item *cache_entry = cache_lookup(request->request_url);
     if (S_ISDIR(fp->f_inode->i_mode)) {
-        struct cache_item *cache_entry = cache_lookup(request->request_url);
-        if (!cache_entry) {
+        SEND_HTTP_MSG(request->socket, buf, "%s%s%s%s%s%s",
+                    "HTTP/1.1 200 OK\r\n", 
+                    "Content-Type: text/html\r\n",
+                    "Transfer-Encoding: chunked\r\n", 
+                    "Connection: ", conn,"\r\n\r\n"
+                    );
+        SEND_HTTP_MSG(
+            request->socket, buf, "7B\r\n%s%s%s%s", 
+            "<html><head><style>\r\n",
+            "body{font-family: monospace; font-size: 15px;}\r\n",
+            "td {padding: 1.5px 6px;}\r\n", 
+            "</style></head><body><table>\r\n");
+        if (!cache_entry){
             cache_entry = cache_create_item(request->request_url);
-            if (!cache_entry) {
-                pr_err("Failed to create cache item for URL: %s\n", request->request_url);
-                filp_close(fp, NULL);
-                return false;
-            }
-
-            snprintf(cache_entry->response_data, 4096,
-                     "HTTP/1.1 200 OK\r\n"
-                     "Content-Type: text/html\r\n"
-                     "Transfer-Encoding: chunked\r\n"
-                     "Connection: %s\r\n\r\n", conn);
-            strncat(cache_entry->response_data,
-                    "<html><head><style>\r\n"
-                    "body{font-family: monospace; font-size: 15px;}\r\n"
-                    "td {padding: 1.5px 6px;}\r\n"
-                    "</style></head><body><table>\r\n", 4096 - strlen(cache_entry->response_data) - 1);
-            cache_entry->response_size = strlen(cache_entry->response_data);
-
+            memset(tempResponse.response, 0, sizeof(tempResponse.response)); // 清空临时响应
             request->dir_context.actor = tracedir;
             iterate_dir(fp, &request->dir_context);
+            cache_insert(request->request_url, tempResponse.response);
+            memset(tempResponse.response, 0, sizeof(tempResponse.response)); // 清空临时响应
+        }else{
+            // Allocate enough memory for the response data plus chunk size and CRLF characters
+            size_t response_length = strlen(cache_entry->response_data);
+            size_t chunk_header_length = snprintf(NULL, 0, "%lx\r\n", response_length); // Calculate length of the chunk header
+            size_t total_length = chunk_header_length + response_length + 2; // 4 extra bytes for the trailing \r\n\r\n
 
-            snprintf(buf, SEND_BUFFER_SIZE, "0\r\n\r\n");
-            size_t len = strnlen(buf, SEND_BUFFER_SIZE);
-            http_server_send(request->socket, buf, len);
+            char *responseData = kmalloc(total_length + 1, GFP_KERNEL); // +1 for the null terminator
+            if (!responseData) {
+                pr_err("Memory allocation failed");
+                return -ENOMEM;
+            }
 
-            cache_insert(request->request_url, cache_entry->response_data);
+            memset(responseData, 0, total_length + 1); // Correct size for memset
 
-            kfree(cache_entry->response_data);
-            kfree(cache_entry);
-        } else {
-            // 缓存存在，直接发送缓存数据
-            SEND_HTTP_MSG(request->socket, buf, "%s", cache_entry->response_data);
+            // Format the chunked response
+            snprintf(responseData, total_length + 1, "%lx\r\n%s\r\n", response_length, cache_entry->response_data);
+
+            // Print the formatted response
+            pr_err("data: %s", responseData);
+
+            // Send the response
+            http_server_send(request->socket, responseData, strlen(responseData));
+
+            // Free the allocated memory
+            kfree(responseData);
         }
+
+
+        SEND_HTTP_MSG(request->socket, buf, "%s",
+                      "16\r\n</table></body></html>\r\n");
+        SEND_HTTP_MSG(request->socket, buf, "%s", "0\r\n\r\n");
+
     } else if (S_ISREG(fp->f_inode->i_mode)) {
-        int file_size = fp->f_inode->i_size;
-        response_data = kmalloc(file_size + SEND_BUFFER_SIZE, GFP_KERNEL);
-        if (!response_data) {
-            pr_err("Failed to allocate memory for response_data\n");
-            filp_close(fp, NULL);
-            return false;
+        if (!cache_entry){
+            char *read_data = kmalloc(fp->f_inode->i_size, GFP_KERNEL);
+            int ret = read_file(fp, read_data);
+
+            SEND_HTTP_MSG(
+                request->socket, buf, "%s%s%s%s%d%s%s%s", "HTTP/1.1 200 OK\r\n",
+                "Content-Type: ", get_mime_str(request->request_url),
+                "\r\nContent-Length: ", ret, "\r\nConnection: ", conn, "\r\n\r\n");
+            cache_entry = cache_create_item(request->request_url);
+            cache_insert(request->request_url, read_data);
+            http_server_send(request->socket, read_data, ret);
+            kfree(read_data);
+        }else{
+            SEND_HTTP_MSG(
+                request->socket, buf, "%s%s%s%s%lx%s%s%s", "HTTP/1.1 200 OK\r\n",
+                "Content-Type: ", get_mime_str(request->request_url),
+                "\r\nContent-Length: ", cache_entry->response_size, "\r\nConnection: ", conn, "\r\n\r\n");
+            http_server_send(request->socket, cache_entry->response_data, cache_entry->response_size);
         }
-
-        snprintf(response_data, SEND_BUFFER_SIZE,
-                 "HTTP/1.1 200 OK\r\n"
-                 "Content-Type: %s\r\n"
-                 "Content-Length: %d\r\n"
-                 "Connection: %s\r\n\r\n", 
-                 get_mime_str(request->request_url), file_size, conn);
-
-        int header_length = strlen(response_data);
-        int ret = read_file(fp, response_data + header_length);
-
-        if (ret < 0) {
-            pr_err("Failed to read file: %d\n", ret);
-            kfree(response_data);
-            filp_close(fp, NULL);
-            return false;
-        }
-
-        size_t response_size = header_length + ret;
-        cache_insert(request->request_url, response_data);
-        http_server_send(request->socket, response_data, response_size);
-        kfree(response_data);
+        
     }
 
     filp_close(fp, NULL);
@@ -236,18 +204,7 @@ static bool handle_directory(struct http_request *request, int keep_alive)
 
 static int http_server_response(struct http_request *request, int keep_alive)
 {
-    struct cache_item *cache_entry;
 
-    // 查找缓存
-    cache_entry = cache_lookup(request->request_url);
-    if (cache_entry) {
-        // 缓存命中，直接返回缓存数据
-        pr_info("Cache hit for URL: %s\n", request->request_url);
-        http_server_send(request->socket, cache_entry->response_data, strlen(cache_entry->response_data));
-        return 0;
-    }
-
-    // 未命中缓存，处理请求并生成响应
     if (!handle_directory(request, keep_alive)) {
         pr_err("Failed to handle request for URL: %s\n", request->request_url);
     }

@@ -164,7 +164,7 @@ static inline bool prio_queue_cmpxchg(rcu_timer_node_t **var,
 /* add a new item to the heap */
 static bool prio_queue_insert(rcu_prio_queue_t *ptr, void *item)
 {
-    rcu_timer_node_t **slot;  // get the address we want to store item
+    rcu_timer_node_t **slot;  
     size_t old_nalloc;
     long long old;
     int retry_count = 0;
@@ -178,7 +178,6 @@ restart:
         return false;
     }
 
-    // get the address want to store
     slot = (rcu_timer_node_t **) &ptr->priv[old_nalloc + 1];
     old = (long long) *slot;
 
@@ -190,7 +189,7 @@ restart:
             } else {
                 goto restart;
             }
-    } while (!prio_queue_cmpxchg(slot, &old, (long long) item));
+    } while (!prio_queue_cmpxchg(slot, &old, (long long)item));
 
     atomic_inc(&ptr->nalloc);
 

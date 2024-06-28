@@ -12,9 +12,9 @@ struct cache_item {
     size_t response_size;    // 响应数据的大小
     size_t max_size;         // 响应数据的最大大小
     struct hlist_node node;  // 哈希表节点
-    struct list_head lru_node; // 添加 lru_node 成员
+    struct list_head lru_node; // LRU 链表节点
+    struct rcu_head rcu;      // RCU 头部，用于延迟释放
 };
-
 void cache_init(void);
 struct cache_item *cache_lookup(const char *url);
 struct cache_item *cache_create_item(const char *url);
